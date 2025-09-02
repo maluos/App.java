@@ -1,0 +1,248 @@
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+
+public class App {
+
+    // Porta onde o servidor HTTP irá rodar
+    static final int PORT = 8080;
+    // Arquivo CSV usado para persistir as tarefas
+    static final String CSV = "data_tasks.csv";
+    // Capacidade máxima de tarefas
+    static final int MAX = 5000;
+
+    // Estruturas simples para armazenar as tarefas
+    static String[] ids = new String[MAX];
+    static String[] titulos = new String[MAX];
+    static String[] descrs = new String[MAX];
+    static int[] status = new int[MAX];     // 0 = TODO, 1 = DOING, 2 = DONE
+    static long[] criados = new long[MAX];  // timestamp de criação
+    static int n = 0; // quantidade de tarefas ativas
+
+    public static void main(String[] args) throws Exception {
+        // Carrega as tarefas salvas do CSV
+        carregar();
+
+        // Cria servidor HTTP
+        HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
+
+        // Rota raiz → devolve a interface HTML
+        server.createContext("/", new RootHandler());
+        // Rota da API para operações com tarefas (CRUD)
+        server.createContext("/api/tasks", new ApiTasksHandler());
+
+        server.setExecutor(null); // executor padrão
+        System.out.println("Servindo em http://localhost:" + PORT);
+        server.start();
+    }
+
+    // Handler da rota raiz → devolve a página HTML do Kanban
+    static class RootHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) { 
+                send(ex, 405, ""); 
+                return; 
+            }
+            byte[] body = INDEX_HTML.getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream os = ex.getResponseBody()) { os.write(body); }
+        }
+    }
+
+    // Handler da rota /api/tasks → fornece endpoints REST
+    static class ApiTasksHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            String method = ex.getRequestMethod();
+            URI uri = ex.getRequestURI();
+            String path = uri.getPath();
+
+            try {
+                // GET /api/tasks → lista todas as tarefas
+                if ("GET".equals(method) && "/api/tasks".equals(path)) {
+                    sendJson(ex, 200, listarJSON());
+                    return;
+                }
+
+                // POST /api/tasks → cria nova tarefa
+                if ("POST".equals(method) && "/api/tasks".equals(path)) {
+                    String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                    String titulo = jsonGet(body, "titulo");
+                    String descricao = jsonGet(body, "descricao");
+
+                    // título é obrigatório
+                    if (titulo == null || titulo.isBlank()) {
+                        sendJson(ex, 400, "{\"error\":\"titulo obrigatório\"}");
+                        return;
+                    }
+
+                    // cria tarefa e salva
+                    Map<String, Object> t = criar(titulo, descricao == null ? "" : descricao);
+                    salvar();
+                    sendJson(ex, 200, toJsonTask(t));
+                    return;
+                }
+
+                // PATCH /api/tasks/{id}/status → altera o status da tarefa
+                if ("PATCH".equals(method) && path.startsWith("/api/tasks/") && path.endsWith("/status")) {
+                    String id = path.substring("/api/tasks/".length(), path.length() - "/status".length());
+                    String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                    String stStr = jsonGet(body, "status");
+                    if (stStr == null) { sendJson(ex, 400, "{\"error\":\"status ausente\"}"); return; }
+                    
+                    int st = clampStatus(parseIntSafe(stStr, 0));
+                    int i = findIdxById(id);
+                    if (i < 0) { sendJson(ex, 404, "{\"error\":\"not found\"}"); return; }
+
+                    status[i] = st;
+                    salvar();
+                    sendJson(ex, 200, toJsonTask(mapOf(i)));
+                    return;
+                }
+
+                // DELETE /api/tasks/{id} → remove tarefa
+                if ("DELETE".equals(method) && path.startsWith("/api/tasks/")) {
+                    String id = path.substring("/api/tasks/".length());
+                    int i = findIdxById(id);
+                    if (i < 0) { sendJson(ex, 404, "{\"error\":\"not found\"}"); return; }
+
+                    // compacta array ao remover
+                    for (int k = i; k < n - 1; k++) {
+                        ids[k] = ids[k+1]; 
+                        titulos[k] = titulos[k+1]; 
+                        descrs[k] = descrs[k+1];
+                        status[k] = status[k+1]; 
+                        criados[k] = criados[k+1];
+                    }
+                    n--;
+                    salvar();
+                    sendJson(ex, 204, "");
+                    return;
+                }
+
+                // Se nada casar → 404
+                send(ex, 404, "");
+            } catch (Exception e) {
+                e.printStackTrace();
+                sendJson(ex, 500, "{\"error\":\"server\"}");
+            }
+        }
+    }
+
+    // HTML da interface Kanban (injetado diretamente no código)
+    static final String INDEX_HTML = """ 
+        ... (HTML e JS da interface, deixei como estava para não poluir os comentários)
+    """;
+
+    // ---------- Persistência em CSV ----------
+
+    // Carrega tarefas salvas no CSV
+    static void carregar() {
+        n = 0;
+        Path p = Paths.get(CSV);
+        if (!Files.exists(p)) return;
+        try (BufferedReader br = Files.newBufferedReader(p, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isBlank() || line.startsWith("id;")) continue;
+                String[] a = splitCsv(line);
+                if (a.length < 5) continue;
+                if (n >= MAX) break;
+                ids[n] = a[0];
+                titulos[n] = a[1];
+                descrs[n] = a[2];
+                status[n] = clampStatus(parseIntSafe(a[3], 0));
+                criados[n] = parseLongSafe(a[4], System.currentTimeMillis());
+                n++;
+            }
+        } catch (IOException e) {
+            System.out.println("Falha ao ler CSV: " + e.getMessage());
+        }
+    }
+
+    // Salva todas as tarefas no CSV
+    static void salvar() {
+        Path p = Paths.get(CSV);
+        try {
+            if (p.getParent()!=null) Files.createDirectories(p.getParent());
+            try (BufferedWriter bw = Files.newBufferedWriter(p, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                bw.write("id;titulo;descricao;status;criadoEm\n");
+                for (int i = 0; i < n; i++) {
+                    bw.write(esc(ids[i]) + ";" + esc(titulos[i]) + ";" + esc(descrs[i]) + ";"
+                            + status[i] + ";" + criados[i] + "\n");
+                }
+            }
+        } catch (IOException e) {
+            System.out.println("Falha ao salvar CSV: " + e.getMessage());
+        }
+    }
+
+    // ---------- Operações com tarefas ----------
+
+    // Cria nova tarefa
+    static Map<String, Object> criar(String titulo, String descr) {
+        if (n >= MAX) throw new RuntimeException("Capacidade cheia");
+        String id = UUID.randomUUID().toString().substring(0,8);
+        ids[n]=id; 
+        titulos[n]=titulo; 
+        descrs[n]=descr; 
+        status[n]=0; 
+        criados[n]=System.currentTimeMillis();
+        n++;
+        return mapOf(n-1);
+    }
+
+    // Busca índice de tarefa pelo ID
+    static int findIdxById(String id){
+        for (int i=0;i<n;i++) if (ids[i].equals(id)) return i;
+        return -1;
+    }
+
+    // Constrói mapa com dados de uma tarefa
+    static Map<String,Object> mapOf(int i){
+        Map<String,Object> m=new LinkedHashMap<>();
+        m.put("id", ids[i]); 
+        m.put("titulo", titulos[i]); 
+        m.put("descricao", descrs[i]);
+        m.put("status", status[i]); 
+        m.put("criadoEm", criados[i]);
+        return m;
+    }
+
+    // Lista todas as tarefas em JSON
+    static String listarJSON(){
+        StringBuilder sb = new StringBuilder("[");
+        for (int i=0;i<n;i++){
+            if (i>0) sb.append(',');
+            sb.append(toJsonTask(mapOf(i)));
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
+    // Converte tarefa (Map) em JSON
+    static String toJsonTask(Map<String,Object> t){
+        return "{\"id\":\""+jsonEsc((String)t.get("id"))+"\"," +
+                "\"titulo\":\""+jsonEsc((String)t.get("titulo"))+"\"," +
+                "\"descricao\":\""+jsonEsc((String)t.get("descricao"))+"\"," +
+                "\"status\":" + t.get("status") + "," +
+                "\"criadoEm\":" + t.get("criadoEm") + "}";
+    }
+
+    // ---------- Utilitários de JSON/CSV ----------
+
+    // Extrai valor de uma chave simples de JSON (implementação manual)
+    static String jsonGet(String body, String key){ ... }
+
+    // Escapes e helpers diversos: send(), sendJson(), esc(), splitCsv(), jsonEsc()...
+    // clampStatus(), parseIntSafe(), parseLongSafe() → proteções básicas
+
+}
